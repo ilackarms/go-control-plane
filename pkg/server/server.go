@@ -29,6 +29,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
 	"github.com/envoyproxy/go-control-plane/pkg/cache"
+	"github.com/solo-io/gloo/pkg/log"
 )
 
 // Server is a collection of handlers for streaming discovery requests.
@@ -166,6 +167,7 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 		if s.callbacks != nil {
 			s.callbacks.OnStreamResponse(streamID, &resp.Request, out)
 		}
+		log.Printf("sending response %v (%v):\n%v", out.TypeUrl, out.VersionInfo, out.Resources)
 		return out.Nonce, stream.Send(out)
 	}
 
@@ -177,6 +179,18 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 		select {
 		// config watcher can send the requested resources types in any order
 		case resp, more := <-values.endpoints:
+			//select {
+			//case resp2, more2 := <-values.clusters:
+			//	if !more2 {
+			//		return status.Errorf(codes.Unavailable, "clusters watch failed")
+			//	}
+			//	nonce, err := send(resp2, cache.ClusterType)
+			//	if err != nil {
+			//		return err
+			//	}
+			//	values.clusterNonce = nonce
+			//default:
+			//}
 			if !more {
 				return status.Errorf(codes.Unavailable, "endpoints watch failed")
 			}
@@ -240,6 +254,8 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 			if s.callbacks != nil {
 				s.callbacks.OnStreamRequest(streamID, req)
 			}
+
+			log.Printf("new request: %v", req)
 
 			// cancel existing watches to (re-)request a newer version
 			switch {

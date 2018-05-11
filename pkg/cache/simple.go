@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/envoyproxy/go-control-plane/pkg/log"
+	"sort"
 )
 
 // SnapshotCache is a snapshot-based cache that maintains a single versioned
@@ -93,6 +94,20 @@ func NewSnapshotCache(ads bool, hash NodeHash, logger log.Logger) SnapshotCache 
 	}
 }
 
+func getType(typeUrl string) int {
+	switch typeUrl {
+	case "type.googleapis.com/envoy.api.v2.Cluster":
+		return 0
+	case "type.googleapis.com/envoy.api.v2.ClusterLoadAssignment":
+		return 1
+	case "type.googleapis.com/envoy.api.v2.Listener":
+		return 2
+	case "type.googleapis.com/envoy.api.v2.RouteConfiguration":
+		return 3
+	}
+	return 4
+}
+
 // SetSnapshotCache updates a snapshot for a node.
 func (cache *snapshotCache) SetSnapshot(node string, snapshot Snapshot) error {
 	cache.mu.Lock()
@@ -104,16 +119,36 @@ func (cache *snapshotCache) SetSnapshot(node string, snapshot Snapshot) error {
 	// trigger existing watches for which version changed
 	if info, ok := cache.status[node]; ok {
 		info.mu.Lock()
+
+		// sort watches based on TypeUrl
+		var sortedWatches []struct{
+			id int64
+			watch ResponseWatch
+		}
 		for id, watch := range info.watches {
-			version := snapshot.GetVersion(watch.Request.TypeUrl)
-			if version != watch.Request.VersionInfo {
+			sortedWatches = append(sortedWatches, struct{
+				id int64
+				watch ResponseWatch
+			}{
+				id: id,
+				watch: watch,
+			})
+		}
+		sort.SliceStable(sortedWatches, func(i, j int) bool {
+			return getType(sortedWatches[i].watch.Request.TypeUrl) < getType(sortedWatches[j].watch.Request.TypeUrl)
+		})
+
+		for _, watch := range sortedWatches {
+			cache.log.Infof("doing response for type url %v",  watch.watch.Request.TypeUrl)
+			version := snapshot.GetVersion(watch.watch.Request.TypeUrl)
+			if version != watch.watch.Request.VersionInfo {
 				if cache.log != nil {
-					cache.log.Infof("respond open watch %d%v with new version %q", id, watch.Request.ResourceNames, version)
+					cache.log.Infof("respond open watch %d%v with new version %v", watch.id, watch.watch.Request.ResourceNames, version)
 				}
-				cache.respond(watch.Request, watch.Response, snapshot.GetResources(watch.Request.TypeUrl), version)
+				cache.respond(watch.watch.Request, watch.watch.Response, snapshot.GetResources(watch.watch.Request.TypeUrl), version)
 
 				// discard the watch
-				delete(info.watches, id)
+				delete(info.watches, watch.id)
 			}
 		}
 		info.mu.Unlock()
@@ -144,7 +179,7 @@ func nameSet(names []string) map[string]bool {
 func superset(names map[string]bool, resources map[string]Resource) error {
 	for resourceName := range resources {
 		if _, exists := names[resourceName]; !exists {
-			return fmt.Errorf("%q not listed", resourceName)
+			return fmt.Errorf("%v not listed in %v", resourceName, names)
 		}
 	}
 	return nil
@@ -174,11 +209,15 @@ func (cache *snapshotCache) CreateWatch(request Request) (chan Response, func())
 	snapshot, exists := cache.snapshots[nodeID]
 	version := snapshot.GetVersion(request.TypeUrl)
 
+	cache.log.Infof("watch request for %s:%v from nodeID %v, version %v",
+		request.TypeUrl, request.ResourceNames,	nodeID, request.VersionInfo)
+
 	// if the requested version is up-to-date or missing a response, leave an open watch
 	if !exists || request.VersionInfo == version {
+		cache.log.Infof("exists")
 		watchID := cache.nextWatchID()
 		if cache.log != nil {
-			cache.log.Infof("open watch %d for %s%v from nodeID %q, version %q", watchID,
+			cache.log.Infof("open watch %v for %s%v from nodeID %v, version %v", watchID,
 				request.TypeUrl, request.ResourceNames, nodeID, request.VersionInfo)
 		}
 		info.mu.Lock()
@@ -187,6 +226,7 @@ func (cache *snapshotCache) CreateWatch(request Request) (chan Response, func())
 		return value, cache.cancelWatch(nodeID, watchID)
 	}
 
+	cache.log.Infof("doesn't exist")
 	// otherwise, the watch may be responded immediately
 	cache.respond(request, value, snapshot.GetResources(request.TypeUrl), version)
 
@@ -214,40 +254,66 @@ func (cache *snapshotCache) cancelWatch(nodeID string, watchID int64) func() {
 // Respond to a watch with the snapshot value. The value channel should have capacity not to block.
 // TODO(kuat) do not respond always, see issue https://github.com/envoyproxy/go-control-plane/issues/46
 func (cache *snapshotCache) respond(request Request, value chan Response, resources map[string]Resource, version string) {
+	cache.log.Infof("resources to respond with: %v", resources)
 	// for ADS, the request names must match the snapshot names
 	// if they do not, then the watch is never responded, and it is expected that envoy makes another request
 	if len(request.ResourceNames) != 0 && cache.ads {
 		if err := superset(nameSet(request.ResourceNames), resources); err != nil {
 			if cache.log != nil {
-				cache.log.Infof("ADS mode: not responding to request: %v", err)
+				cache.log.Infof("ADS mode: not responding to request: %v with err: %v", request, err)
 			}
 			return
 		}
 	}
 	if cache.log != nil {
-		cache.log.Infof("respond %s%v version %q with version %q",
+		cache.log.Infof("respond %s%v request version %v with server version %v",
 			request.TypeUrl, request.ResourceNames, request.VersionInfo, version)
 	}
 
-	value <- createResponse(request, resources, version)
+	resp := createResponse(request, resources, version)
+	cache.log.Infof("finished xDS Response: %v", resp)
+
+	value <- resp
 }
 
 func createResponse(request Request, resources map[string]Resource, version string) Response {
 	filtered := make([]Resource, 0, len(resources))
+
+	var orderedResources []struct {
+		name     string
+		resource Resource
+	}
+
+	var count int
+
+	for name, resource := range resources {
+		orderedResources = append(orderedResources, struct {
+			name     string
+			resource Resource
+		}{
+			name:     name,
+			resource: resource,
+		})
+		fmt.Printf("\n%v: %v\n", count, name)
+		count++
+	}
+	sort.SliceStable(orderedResources, func(i, j int) bool {
+		return orderedResources[i].name < orderedResources[j].name
+	})
 
 	// Reply only with the requested resources. Envoy may ask each resource
 	// individually in a separate stream. It is ok to reply with the same version
 	// on separate streams since requests do not share their response versions.
 	if len(request.ResourceNames) != 0 {
 		set := nameSet(request.ResourceNames)
-		for name, resource := range resources {
-			if set[name] {
-				filtered = append(filtered, resource)
+		for _, resource := range orderedResources {
+			if set[resource.name] {
+				filtered = append(filtered, resource.resource)
 			}
 		}
 	} else {
-		for _, resource := range resources {
-			filtered = append(filtered, resource)
+		for _, resource := range orderedResources {
+			filtered = append(filtered, resource.resource)
 		}
 	}
 
@@ -279,7 +345,7 @@ func (cache *snapshotCache) Fetch(ctx context.Context, request Request) (*Respon
 		return &out, nil
 	}
 
-	return nil, fmt.Errorf("missing snapshot for %q", nodeID)
+	return nil, fmt.Errorf("missing snapshot for %v", nodeID)
 }
 
 // GetStatusInfo retrieves the status info for the node.
